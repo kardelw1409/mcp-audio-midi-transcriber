@@ -1,0 +1,18 @@
+[project]
+name = "mcp-audio-midi-transcriber"
+version = "0.1.0"
+description = "MCP server for GPU-first audio to MIDI transcription."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0.0",
+  "torch>=2.1.0",
+  "basic-pitch>=0.2.6",
+  "numpy>=1.23.0",
+  "scipy>=1.9.0",
+  "librosa>=0.10.0",
+  "soundfile>=0.12.1",
+  "pretty_midi>=0.2.10",
+]
+
+[project.scripts]
+mcp-audio-midi-transcriber = "mcp_audio_midi_transcriber.__main__:main"
