@@ -117,6 +117,10 @@ def _grid_step_seconds(config: GridConfig) -> float:
     return step
 
 
+def _hard_quantize(t: float, grid: float) -> float:
+    return round(t / grid) * grid
+
+
 def _grid_bounds(config: GridConfig) -> tuple[float, float | None]:
     if config.start_bar < 1:
         raise ValueError("start_bar must be >= 1")
@@ -133,19 +137,19 @@ def _grid_bounds(config: GridConfig) -> tuple[float, float | None]:
 
 def _quantize_time(time_value: float, config: GridConfig) -> float:
     step = _grid_step_seconds(config)
-    return round(time_value / step) * step
+    return _hard_quantize(time_value, step)
 
 
 def _quantize_time_relative(time_value: float, config: GridConfig) -> float:
     step = _grid_step_seconds(config)
     relative = time_value - config.grid_start_seconds
-    snapped = round(relative / step) * step
+    snapped = _hard_quantize(relative, step)
     return config.grid_start_seconds + snapped
 
 
 def _quantize_duration(duration: float, config: GridConfig, min_seconds: float) -> float:
     step = _grid_step_seconds(config)
-    snapped = max(min_seconds, round(duration / step) * step)
+    snapped = max(min_seconds, _hard_quantize(duration, step))
     return max(snapped, min_seconds)
 
 
@@ -281,6 +285,7 @@ def _transcribe_drums(
     warnings: list[str] = []
 
     def _make_notes(onsets: list[float], label: str, base_velocity: int) -> None:
+        step = _grid_step_seconds(config)
         for onset_time in onsets:
             start = max(0.0, float(onset_time) + float(offset))
             end = start + 0.08
@@ -288,9 +293,10 @@ def _transcribe_drums(
             if clipped is None:
                 continue
             start, end = clipped
-            start = _quantize_time_relative(start, config)
-            duration = _quantize_duration(end - start, config, min_seconds=0.05)
-            end = start + duration
+            start = _hard_quantize(start, step)
+            end = _hard_quantize(end, step)
+            if end <= start:
+                end = start + step
             if window_end is not None and end > window_end:
                 end = window_end
             notes[label].append((start, end, base_velocity))
@@ -311,9 +317,11 @@ def _transcribe_drums(
         if clipped is None:
             continue
         start, end = clipped
-        start = _quantize_time_relative(start, config)
-        duration = _quantize_duration(end - start, config, min_seconds=0.05)
-        end = start + duration
+        step = _grid_step_seconds(config)
+        start = _hard_quantize(start, step)
+        end = _hard_quantize(end, step)
+        if end <= start:
+            end = start + step
         if window_end is not None and end > window_end:
             end = window_end
         notes["snare"].append((start, end, velocity))
@@ -353,6 +361,7 @@ def _predict_basic_pitch(
     onset_threshold: float,
     frame_threshold: float,
     min_note_length: float,
+    tempo_bpm: float,
 ) -> tuple[Any, list[str]]:
     notes: list[str] = []
 
@@ -381,6 +390,7 @@ def _predict_basic_pitch(
             min_freq=min_freq,
             max_freq=max_freq,
             min_note_length=min_note_length,
+            tempo_bpm=tempo_bpm,
             notes=notes,
         )
 
@@ -391,56 +401,130 @@ def _fallback_pitch_transcription(
     min_freq: float,
     max_freq: float,
     min_note_length: float,
+    tempo_bpm: float,
     notes: list[str],
 ) -> tuple[Any, list[str]]:
     import numpy as np
     import librosa
     import pretty_midi
 
+    hop_length = 512
     y, sr = librosa.load(path=str(audio_path), mono=True, sr=22050)
     f0, voiced_flag, _ = librosa.pyin(
         y,
         fmin=max(20.0, float(min_freq)),
         fmax=max(float(min_freq), float(max_freq)),
+        hop_length=hop_length,
         sr=sr,
     )
-    frame_times = librosa.times_like(f0, sr=sr)
+    frame_times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
+    midi_values = librosa.hz_to_midi(f0)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length, center=True)[0]
 
-    midi = pretty_midi.PrettyMIDI()
+    if len(rms) < len(midi_values):
+        pad_value = float(rms[-1]) if len(rms) else 0.0
+        rms = np.pad(rms, (0, len(midi_values) - len(rms)), mode="constant", constant_values=pad_value)
+    elif len(rms) > len(midi_values):
+        rms = rms[: len(midi_values)]
+
+    def _median_smooth(arr: Any, k: int = 5) -> list[float | None]:
+        result: list[float | None] = []
+        half = k // 2
+        for index in range(len(arr)):
+            window = arr[max(0, index - half) : min(len(arr), index + half + 1)]
+            window = [value for value in window if value is not None and np.isfinite(value)]
+            result.append(float(np.median(window)) if window else None)
+        return result
+
+    def _apply_hysteresis(midi: list[float | None], threshold: float = 0.5) -> list[float | None]:
+        stable: list[float | None] = []
+        last: float | None = None
+
+        for pitch in midi:
+            if pitch is None:
+                stable.append(None)
+                continue
+
+            if last is None:
+                stable.append(float(pitch))
+                last = float(pitch)
+                continue
+
+            if abs(float(pitch) - last) < threshold:
+                stable.append(last)
+            else:
+                stable.append(float(pitch))
+                last = float(pitch)
+
+        return stable
+
+    smoothed_midi = _median_smooth(midi_values, k=5)
+    stable_midi = _apply_hysteresis(smoothed_midi, threshold=0.5)
+
+    for index, voiced in enumerate(voiced_flag):
+        if not voiced:
+            stable_midi[index] = None
+
+    midi = pretty_midi.PrettyMIDI(initial_tempo=tempo_bpm)
     instrument = pretty_midi.Instrument(program=0, is_drum=False)
 
-    segment_start = None
-    segment_pitch = None
-    last_time = float(librosa.get_duration(y=y, sr=sr))
+    segment_frames: list[int] = []
+    segment_pitches: list[float] = []
+    segment_energies: list[float] = []
+    frame_hop_seconds = hop_length / sr
 
-    for index, freq in enumerate(f0):
-        is_voiced = bool(voiced_flag[index]) and freq is not None and np.isfinite(freq)
-        pitch = int(round(librosa.hz_to_midi(float(freq)))) if is_voiced else None
-        time_value = float(frame_times[index])
+    def _flush_segment() -> None:
+        if len(segment_frames) < 3:
+            segment_frames.clear()
+            segment_pitches.clear()
+            segment_energies.clear()
+            return
 
-        if is_voiced and pitch is not None:
-            if segment_start is None:
-                segment_start = time_value
-                segment_pitch = pitch
-            elif abs(pitch - segment_pitch) > 1:
-                if time_value - segment_start >= min_note_length:
-                    instrument.notes.append(
-                        pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=time_value)
-                    )
-                segment_start = time_value
-                segment_pitch = pitch
-        elif segment_start is not None:
-            if time_value - segment_start >= min_note_length:
-                instrument.notes.append(
-                    pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=time_value)
-                )
-            segment_start = None
-            segment_pitch = None
+        start_idx = segment_frames[0]
+        end_idx = segment_frames[-1]
+        start_time = float(frame_times[start_idx])
+        end_time = float(frame_times[end_idx] + frame_hop_seconds)
+        if end_time <= start_time:
+            end_time = start_time + frame_hop_seconds
+        if end_time - start_time < min_note_length:
+            segment_frames.clear()
+            segment_pitches.clear()
+            segment_energies.clear()
+            return
 
-    if segment_start is not None and last_time - segment_start >= min_note_length and segment_pitch is not None:
+        average_pitch = float(np.mean(segment_pitches))
+        if not np.isfinite(average_pitch):
+            segment_frames.clear()
+            segment_pitches.clear()
+            segment_energies.clear()
+            return
+
+        velocity = int(np.clip(float(np.mean(segment_energies)) * 127.0 * 3.0, 30, 110))
         instrument.notes.append(
-            pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=last_time)
+            pretty_midi.Note(
+                velocity=velocity,
+                pitch=int(round(average_pitch)),
+                start=start_time,
+                end=end_time,
+            )
         )
+        segment_frames.clear()
+        segment_pitches.clear()
+        segment_energies.clear()
+
+    for index, pitch in enumerate(stable_midi):
+        if pitch is None or not np.isfinite(pitch):
+            _flush_segment()
+            continue
+
+        if segment_pitches and abs(float(pitch) - float(segment_pitches[-1])) >= 1.0:
+            _flush_segment()
+
+        segment_frames.append(index)
+        segment_pitches.append(float(pitch))
+        segment_energies.append(float(rms[index]))
+
+    _flush_segment()
 
     midi.instruments.append(instrument)
     notes.append("Used librosa.pyin fallback because Basic Pitch was unavailable.")
@@ -473,9 +557,11 @@ def _clean_pitch_notes(
             if clipped is None:
                 continue
             start, end = clipped
-            start = _quantize_time(start, config)
-            duration = _quantize_duration(end - start, config, min_seconds=min_note_length)
-            end = start + duration
+            step = _grid_step_seconds(config)
+            start = _hard_quantize(start, step)
+            end = _hard_quantize(end, step)
+            if end <= start:
+                end = start + step
             note.start = start
             note.end = end
             note.velocity = _normalize_velocity(note.velocity, min_velocity=min_velocity)
@@ -663,6 +749,7 @@ def transcribe_audio_core(
             end_bar=end_bar,
             steps_per_bar=steps_per_bar,
         )
+        min_note_length = _grid_step_seconds(config)
 
         hardware = _detect_hardware()
 
@@ -720,6 +807,7 @@ def transcribe_audio_core(
                 onset_threshold=onset_threshold,
                 frame_threshold=frame_threshold,
                 min_note_length=min_note_length,
+                tempo_bpm=tempo,
             )
             notes.extend(warnings)
 
@@ -824,6 +912,7 @@ def refine_midi_engine(
     magenta_variations: int = 2,
     key: str = "auto",
     quantize_strength: float = 0.8,
+    strict_pitch: bool = False,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
     return refine_midi_engine_core(
@@ -835,6 +924,7 @@ def refine_midi_engine(
         magenta_variations=magenta_variations,
         key=key,
         quantize_strength=quantize_strength,
+        strict_pitch=strict_pitch,
         output_dir=output_dir,
     )
 
@@ -848,6 +938,7 @@ def refine_midi_engine_core(
     magenta_variations: int = 2,
     key: str = "auto",
     quantize_strength: float = 0.8,
+    strict_pitch: bool = False,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -892,6 +983,7 @@ def refine_midi_engine_core(
         tempo_bpm = float(tempo_changes[1][0]) if len(tempo_changes[1]) > 0 else 120.0
         beat_length = 60.0 / tempo_bpm
         grid = beat_length / 4.0  # sixteenth-note grid
+        strict_pitch = bool(strict_pitch or mode in {"vocals", "melody"})
 
         # --- 3. Key Detection ---
         NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -935,9 +1027,14 @@ def refine_midi_engine_core(
                         result.append(p)
             return sorted(set(result))
 
-        detected_key = _detect_key_auto(all_notes) if key == "auto" else key
-        notes_log.append(f"{'Detected' if key == 'auto' else 'Using provided'} key: {detected_key}")
-        scale_pitches = _get_scale_pitches(detected_key)
+        if strict_pitch:
+            detected_key = "strict_pitch"
+            scale_pitches: list[int] = []
+            notes_log.append("Strict pitch mode enabled; skipping key detection and scale snapping.")
+        else:
+            detected_key = _detect_key_auto(all_notes) if key == "auto" else key
+            notes_log.append(f"{'Detected' if key == 'auto' else 'Using provided'} key: {detected_key}")
+            scale_pitches = _get_scale_pitches(detected_key)
 
         # --- 4. Scale Snapping ---
         def _snap_to_scale(pitch: int, scale: list[int]) -> int:
@@ -1000,8 +1097,8 @@ def refine_midi_engine_core(
 
         # --- 6. Rhythm Quantization ---
         def _quantize_t(t: float, g: float, strength: float) -> float:
-            snapped = round(t / g) * g
-            return max(0.0, t + strength * (snapped - t))
+            _ = strength
+            return _hard_quantize(t, g)
 
         # --- 11. Cleanup (defined early; used throughout) ---
         def _cleanup(note_list: list[Any], min_dur: float = 0.05) -> list[Any]:
@@ -1062,10 +1159,12 @@ def refine_midi_engine_core(
                 if root_cands:
                     snapped = min(root_cands, key=lambda p: abs(p - target))
             note.pitch = snapped
-            note.start = _quantize_t(note.start, beat_length, 1.0)
+            note.start = _hard_quantize(note.start, grid)
             # Longer note durations for bass — at least 1.5 beats
-            dur = max(beat_length * 1.5, round((note.end - note.start) / beat_length) * beat_length)
-            note.end = note.start + dur
+            dur = max(beat_length * 1.5, round((note.end - note.start) / grid) * grid)
+            note.end = _hard_quantize(note.start + dur, grid)
+            if note.end <= note.start:
+                note.end = note.start + grid
             return note
 
         def _expand_chords(note_list: list[Any], scale: list[int]) -> list[Any]:
@@ -1089,27 +1188,31 @@ def refine_midi_engine_core(
 
         # --- 8. Build refined notes ---
         orig_pitches = [n.pitch for n in all_notes]
-        # Context-aware directional snapping
-        snapped: list[int] = []
-        for _si, _p in enumerate(orig_pitches):
-            _prev = snapped[_si - 1] if _si > 0 else None
-            snapped.append(_snap_to_scale_directional(_p, scale_pitches, _prev))
-        contoured = _apply_contour(snapped, orig_pitches, scale_pitches, preserve_intent)
+        if strict_pitch or not scale_pitches:
+            contoured = orig_pitches
+        else:
+            # Context-aware directional snapping
+            snapped: list[int] = []
+            for _si, _p in enumerate(orig_pitches):
+                _prev = snapped[_si - 1] if _si > 0 else None
+                snapped.append(_snap_to_scale_directional(_p, scale_pitches, _prev))
+            contoured = _apply_contour(snapped, orig_pitches, scale_pitches, preserve_intent)
 
         refined_notes: list[Any] = []
         for i, note in enumerate(all_notes):
             n = copy.copy(note)
-            n.pitch = contoured[i]
-            n.start = _quantize_t(n.start, grid, quantize_strength)
-            dur = n.end - n.start
-            n.end = n.start + max(grid * 0.5, dur)
+            n.pitch = int(round(note.pitch if strict_pitch else contoured[i]))
+            n.start = _hard_quantize(n.start, grid)
+            n.end = _hard_quantize(n.end, grid)
+            if n.end <= n.start:
+                n.end = n.start + grid
             n.velocity = _normalize_velocity(n.velocity, min_velocity=1)
-            if mode == "bass":
+            if not strict_pitch and mode == "bass":
                 n = _apply_bass_mode(n)
             refined_notes.append(n)
 
         refined_notes = _cleanup(refined_notes)
-        if mode == "chords":
+        if not strict_pitch and scale_pitches and mode == "chords":
             refined_notes = _cleanup(_expand_chords(refined_notes, scale_pitches))
 
         # --- 12. Output directory ---
@@ -1142,7 +1245,7 @@ def refine_midi_engine_core(
 
         # Save CLEAN MIDI (subtle humanization applied; refined_notes kept pure for variations)
         clean_path = out_path / f"{stem_name}_clean.mid"
-        _write_notes_to_midi(_cleanup(_humanize(list(refined_notes))), clean_path, tempo_bpm)
+        _write_notes_to_midi(_cleanup(list(refined_notes)), clean_path, tempo_bpm)
         midi_files_out.append(str(clean_path))
         notes_log.append(f"Saved clean MIDI: {clean_path.name}")
 
@@ -1206,28 +1309,32 @@ def refine_midi_engine_core(
 
         rng = np.random.default_rng(42)
         for var_idx in range(num_variations):
-            var_type = _VAR_TYPES[var_idx % len(_VAR_TYPES)]
-            var_rng = np.random.default_rng(42 + var_idx * 13)
-            if var_type == "phrase_shift":
-                shift = int(var_rng.choice([-2, -1, 1, 2]))
-                var_notes = _make_phrase_shift(refined_notes, shift)
-                label = f"phrase_shift_{'p' if shift > 0 else 'm'}{abs(shift)}"
-            elif var_type == "rhythm":
-                var_notes = _make_rhythm_var(refined_notes, var_rng)
-                label = "rhythm"
-            elif var_type == "density":
-                var_notes = _make_density_var(refined_notes, var_rng)
-                label = "density"
-            elif var_type == "velocity_phrasing":
-                var_notes = _make_velocity_phrasing(refined_notes)
-                label = "velocity_phrasing"
+            if strict_pitch:
+                var_notes = _cleanup([copy.copy(note) for note in refined_notes])
+                label = f"strict_{var_idx}"
             else:
-                shift = int(var_rng.choice([-1, 1]))
-                var_notes = _make_phrase_shift(refined_notes, shift)
-                var_notes = _make_rhythm_var(var_notes, var_rng)
-                label = "combined"
-            if mode == "chords":
-                var_notes = _cleanup(_expand_chords(var_notes, scale_pitches))
+                var_type = _VAR_TYPES[var_idx % len(_VAR_TYPES)]
+                var_rng = np.random.default_rng(42 + var_idx * 13)
+                if var_type == "phrase_shift":
+                    shift = int(var_rng.choice([-2, -1, 1, 2]))
+                    var_notes = _make_phrase_shift(refined_notes, shift)
+                    label = f"phrase_shift_{'p' if shift > 0 else 'm'}{abs(shift)}"
+                elif var_type == "rhythm":
+                    var_notes = _make_rhythm_var(refined_notes, var_rng)
+                    label = "rhythm"
+                elif var_type == "density":
+                    var_notes = _make_density_var(refined_notes, var_rng)
+                    label = "density"
+                elif var_type == "velocity_phrasing":
+                    var_notes = _make_velocity_phrasing(refined_notes)
+                    label = "velocity_phrasing"
+                else:
+                    shift = int(var_rng.choice([-1, 1]))
+                    var_notes = _make_phrase_shift(refined_notes, shift)
+                    var_notes = _make_rhythm_var(var_notes, var_rng)
+                    label = "combined"
+                if mode == "chords":
+                    var_notes = _cleanup(_expand_chords(var_notes, scale_pitches))
             var_path = out_path / f"{stem_name}_var_{label}.mid"
             if str(var_path) in midi_files_out:
                 var_path = out_path / f"{stem_name}_var_{label}_{var_idx}.mid"
@@ -1297,7 +1404,14 @@ def refine_midi_engine_core(
                 "Generating structurally distinct fallback variations."
             )
 
-        if magenta_ok:
+        if strict_pitch:
+            for mag_idx in range(magenta_variations):
+                mag_notes_fb = _cleanup([copy.copy(note) for note in refined_notes])
+                mag_path = out_path / f"{stem_name}_magenta_strict_{mag_idx}.mid"
+                _write_notes_to_midi(mag_notes_fb, mag_path, tempo_bpm)
+                midi_files_out.append(str(mag_path))
+            notes_log.append(f"Saved {magenta_variations} strict-pitch Magenta placeholders.")
+        elif magenta_ok:
             try:
                 ns = note_seq.midi_file_to_note_sequence(str(clean_path))
                 for mag_idx in range(magenta_variations):
@@ -1336,7 +1450,7 @@ def refine_midi_engine_core(
                 )
                 magenta_ok = False
 
-        if not magenta_ok:
+        if not strict_pitch and not magenta_ok:
             for mag_idx in range(magenta_variations):
                 mag_rng_inst = np.random.default_rng(99 + mag_idx * 31)
                 transform = _MAG_TRANSFORMS[mag_idx % len(_MAG_TRANSFORMS)]
