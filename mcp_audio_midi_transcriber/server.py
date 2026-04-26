@@ -354,25 +354,97 @@ def _predict_basic_pitch(
     frame_threshold: float,
     min_note_length: float,
 ) -> tuple[Any, list[str]]:
-    from basic_pitch import ICASSP_2022_MODEL_PATH
-    from basic_pitch.inference import predict
-
     notes: list[str] = []
 
-    model_output, midi_data, _ = predict(
-        str(audio_path),
-        ICASSP_2022_MODEL_PATH,
-        onset_threshold=onset_threshold,
-        frame_threshold=frame_threshold,
-        minimum_note_length=min_note_length,
-        minimum_frequency=min_freq,
-        maximum_frequency=max_freq,
-    )
-    _ = model_output
+    try:
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import predict
 
-    if midi_data is None:
-        notes.append("Basic Pitch returned no MIDI data.")
-    return midi_data, notes
+        model_output, midi_data, _ = predict(
+            str(audio_path),
+            ICASSP_2022_MODEL_PATH,
+            onset_threshold=onset_threshold,
+            frame_threshold=frame_threshold,
+            minimum_note_length=min_note_length,
+            minimum_frequency=min_freq,
+            maximum_frequency=max_freq,
+        )
+        _ = model_output
+
+        if midi_data is None:
+            notes.append("Basic Pitch returned no MIDI data.")
+        return midi_data, notes
+    except Exception as exc:
+        notes.append(f"Basic Pitch unavailable; using librosa.pyin fallback: {exc}")
+        return _fallback_pitch_transcription(
+            audio_path=audio_path,
+            min_freq=min_freq,
+            max_freq=max_freq,
+            min_note_length=min_note_length,
+            notes=notes,
+        )
+
+
+def _fallback_pitch_transcription(
+    *,
+    audio_path: Path,
+    min_freq: float,
+    max_freq: float,
+    min_note_length: float,
+    notes: list[str],
+) -> tuple[Any, list[str]]:
+    import numpy as np
+    import librosa
+    import pretty_midi
+
+    y, sr = librosa.load(path=str(audio_path), mono=True, sr=22050)
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=max(20.0, float(min_freq)),
+        fmax=max(float(min_freq), float(max_freq)),
+        sr=sr,
+    )
+    frame_times = librosa.times_like(f0, sr=sr)
+
+    midi = pretty_midi.PrettyMIDI()
+    instrument = pretty_midi.Instrument(program=0, is_drum=False)
+
+    segment_start = None
+    segment_pitch = None
+    last_time = float(librosa.get_duration(y=y, sr=sr))
+
+    for index, freq in enumerate(f0):
+        is_voiced = bool(voiced_flag[index]) and freq is not None and np.isfinite(freq)
+        pitch = int(round(librosa.hz_to_midi(float(freq)))) if is_voiced else None
+        time_value = float(frame_times[index])
+
+        if is_voiced and pitch is not None:
+            if segment_start is None:
+                segment_start = time_value
+                segment_pitch = pitch
+            elif abs(pitch - segment_pitch) > 1:
+                if time_value - segment_start >= min_note_length:
+                    instrument.notes.append(
+                        pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=time_value)
+                    )
+                segment_start = time_value
+                segment_pitch = pitch
+        elif segment_start is not None:
+            if time_value - segment_start >= min_note_length:
+                instrument.notes.append(
+                    pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=time_value)
+                )
+            segment_start = None
+            segment_pitch = None
+
+    if segment_start is not None and last_time - segment_start >= min_note_length and segment_pitch is not None:
+        instrument.notes.append(
+            pretty_midi.Note(velocity=80, pitch=int(segment_pitch), start=segment_start, end=last_time)
+        )
+
+    midi.instruments.append(instrument)
+    notes.append("Used librosa.pyin fallback because Basic Pitch was unavailable.")
+    return midi, notes
 
 
 def _clean_pitch_notes(
@@ -514,8 +586,28 @@ def _write_manifest(
 ###############################################################################
 
 
-@mcp.tool()
-def transcribe_audio(
+@mcp.tool("transcribe_audio")
+def transcribe_audio(audio_path: str, stem_type: StemType, output_dir: str = "midi_transcribed", tempo: float | None = None, grid_start_seconds: float | None = None, start_bar: int = 1, end_bar: int | None = None, bars: dict[str, int] | None = None, steps_per_bar: int = 16, section_name: str | None = None, onset_threshold: float = 0.1, frame_threshold: float = 0.3, min_note_length: float = 0.05, min_velocity: int = 28, drums_fast_mode: bool = True) -> dict[str, Any]:
+    return transcribe_audio_core(
+        audio_path=audio_path,
+        stem_type=stem_type,
+        output_dir=output_dir,
+        tempo=tempo,
+        grid_start_seconds=grid_start_seconds,
+        start_bar=start_bar,
+        end_bar=end_bar,
+        bars=bars,
+        steps_per_bar=steps_per_bar,
+        section_name=section_name,
+        onset_threshold=onset_threshold,
+        frame_threshold=frame_threshold,
+        min_note_length=min_note_length,
+        min_velocity=min_velocity,
+        drums_fast_mode=drums_fast_mode,
+    )
+
+
+def transcribe_audio_core(
     audio_path: str,
     stem_type: StemType,
     output_dir: str = "midi_transcribed",
@@ -687,7 +779,7 @@ def transcribe_audio(
             notes=notes,
         )
 
-        return {
+        result = {
             "input": str(input_path),
             "stem_type": result.stem_type,
             "output_dir": str(result.output_dir),
@@ -695,17 +787,588 @@ def transcribe_audio(
             "manifest_path": result.manifest_path,
             "notes": result.notes,
         }
+        editable_marker = os.environ.get("MCP_WORKFLOW_EDITABLE_TEST")
+        if editable_marker:
+            result["editable_install_marker"] = editable_marker
+        return result
     except Exception as exc:
         trace = traceback.format_exc()
         logger.error("Transcription failed: %s", exc)
         logger.error(trace)
-        return {
+        result = {
             "input": str(audio_path),
             "stem_type": stem_type,
             "output_dir": output_dir,
             "midi_files": {},
             "manifest_path": "",
             "notes": ["transcription_failed", str(exc), trace],
+        }
+        editable_marker = os.environ.get("MCP_WORKFLOW_EDITABLE_TEST")
+        if editable_marker:
+            result["editable_install_marker"] = editable_marker
+        return result
+
+
+###############################################################################
+# MIDI Refinement Engine
+###############################################################################
+
+
+@mcp.tool("refine_midi_engine")
+def refine_midi_engine(
+    midi_path: str,
+    mode: str = "melody",
+    variation: float = 0.3,
+    preserve_intent: float = 0.8,
+    num_variations: int = 5,
+    magenta_variations: int = 2,
+    key: str = "auto",
+    quantize_strength: float = 0.8,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    return refine_midi_engine_core(
+        midi_path=midi_path,
+        mode=mode,
+        variation=variation,
+        preserve_intent=preserve_intent,
+        num_variations=num_variations,
+        magenta_variations=magenta_variations,
+        key=key,
+        quantize_strength=quantize_strength,
+        output_dir=output_dir,
+    )
+
+
+def refine_midi_engine_core(
+    midi_path: str,
+    mode: str = "melody",
+    variation: float = 0.3,
+    preserve_intent: float = 0.8,
+    num_variations: int = 5,
+    magenta_variations: int = 2,
+    key: str = "auto",
+    quantize_strength: float = 0.8,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """
+    Transform a dirty MIDI file into multiple musically improved MIDI variations.
+    Produces a clean refined base, deterministic variations, and Magenta-style variations.
+    """
+    _configure_logging()
+    notes_log: list[str] = []
+
+    try:
+        import copy
+        import pretty_midi
+        import numpy as np
+
+        # --- 1. Load MIDI ---
+        midi_in_path = Path(midi_path).expanduser().resolve()
+        if not midi_in_path.exists():
+            raise FileNotFoundError(f"midi_path not found: {midi_in_path}")
+        pm = pretty_midi.PrettyMIDI(str(midi_in_path))
+
+        all_notes: list[Any] = []
+        for instrument in pm.instruments:
+            for note in instrument.notes:
+                all_notes.append(note)
+        all_notes.sort(key=lambda n: n.start)
+
+        if not all_notes:
+            raise ValueError("No notes found in MIDI file.")
+
+        # --- 2. Analyze MIDI ---
+        pitches = [n.pitch for n in all_notes]
+        durations = [n.end - n.start for n in all_notes]
+        pitch_min, pitch_max = min(pitches), max(pitches)
+        end_time = pm.get_end_time()
+        note_density = len(all_notes) / max(end_time, 1e-9)
+        notes_log.append(
+            f"Analysis: {len(all_notes)} notes, pitch range {pitch_min}-{pitch_max}, "
+            f"density {note_density:.2f} notes/sec, avg_duration {sum(durations) / len(durations):.3f}s"
+        )
+
+        tempo_changes = pm.get_tempo_changes()
+        tempo_bpm = float(tempo_changes[1][0]) if len(tempo_changes[1]) > 0 else 120.0
+        beat_length = 60.0 / tempo_bpm
+        grid = beat_length / 4.0  # sixteenth-note grid
+
+        # --- 3. Key Detection ---
+        NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11]
+        MINOR_INTERVALS = [0, 2, 3, 5, 7, 8, 10]
+
+        def _build_pitch_histogram(note_list: list[Any]) -> np.ndarray:
+            hist = np.zeros(12)
+            for n in note_list:
+                hist[n.pitch % 12] += 1
+            return hist
+
+        def _detect_key_auto(note_list: list[Any]) -> str:
+            hist = _build_pitch_histogram(note_list)
+            hist_norm = hist / (hist.sum() + 1e-9)
+            best_score = -1.0
+            best_key = "C major"
+            for root in range(12):
+                for profile, suffix in [(MAJOR_PROFILE, "major"), (MINOR_PROFILE, "minor")]:
+                    rotated = np.roll(profile, root)
+                    norm = rotated / (rotated.sum() + 1e-9)
+                    score = float(np.dot(hist_norm, norm))
+                    if score > best_score:
+                        best_score = score
+                        best_key = f"{NOTE_NAMES[root]} {suffix}"
+            return best_key
+
+        def _get_scale_pitches(key_str: str) -> list[int]:
+            parts = key_str.strip().split()
+            root_name = parts[0] if parts else "C"
+            mode_name = parts[1] if len(parts) > 1 else "major"
+            root = NOTE_NAMES.index(root_name) if root_name in NOTE_NAMES else 0
+            intervals = MAJOR_INTERVALS if mode_name == "major" else MINOR_INTERVALS
+            result: list[int] = []
+            for octave in range(11):
+                for interval in intervals:
+                    p = root + interval + 12 * octave
+                    if 0 <= p <= 127:
+                        result.append(p)
+            return sorted(set(result))
+
+        detected_key = _detect_key_auto(all_notes) if key == "auto" else key
+        notes_log.append(f"{'Detected' if key == 'auto' else 'Using provided'} key: {detected_key}")
+        scale_pitches = _get_scale_pitches(detected_key)
+
+        # --- 4. Scale Snapping ---
+        def _snap_to_scale(pitch: int, scale: list[int]) -> int:
+            if not scale:
+                return pitch
+            return min(scale, key=lambda p: (abs(p - pitch), p))
+
+        def _scale_idx(pitch: int, scale: list[int]) -> int:
+            snapped = _snap_to_scale(pitch, scale)
+            try:
+                return scale.index(snapped)
+            except ValueError:
+                return 0
+
+        def _snap_to_scale_directional(pitch: int, scale: list[int], prev_pitch: int | None) -> int:
+            """Snap to nearest scale pitch while respecting melodic direction."""
+            if not scale or prev_pitch is None:
+                return _snap_to_scale(pitch, scale)
+            direction = pitch - prev_pitch
+            if direction > 0:
+                candidates = [p for p in scale if p >= prev_pitch]
+            elif direction < 0:
+                candidates = [p for p in scale if p <= prev_pitch]
+            else:
+                candidates = scale
+            if not candidates:
+                candidates = scale
+            snapped = min(candidates, key=lambda p: abs(p - pitch))
+            # fall back to nearest if directional snap introduces a large jump
+            if abs(snapped - pitch) > 12 and abs(direction) <= 12:
+                snapped = _snap_to_scale(pitch, scale)
+            return snapped
+
+        # --- 5. Preserve Melodic Contour ---
+        def _apply_contour(
+            snapped_list: list[int],
+            orig_list: list[int],
+            scale: list[int],
+            strength: float,
+        ) -> list[int]:
+            if len(snapped_list) < 2:
+                return list(snapped_list)
+            result = [snapped_list[0]]
+            for i in range(1, len(snapped_list)):
+                interval = orig_list[i] - orig_list[i - 1]
+                cur = result[-1]
+                cur_idx = _scale_idx(cur, scale)
+                # Map semitone interval to approximate scale steps (~2 semitones per diatonic step)
+                scale_step = (
+                    round(interval / 2.0)
+                    if abs(interval) >= 2
+                    else (1 if interval > 0 else (-1 if interval < 0 else 0))
+                )
+                target_idx = max(0, min(len(scale) - 1, cur_idx + scale_step))
+                contour_pitch = scale[target_idx]
+                # high strength → preserve computed contour; low → allow nearest-pitch snap
+                blended = int(round(strength * contour_pitch + (1.0 - strength) * snapped_list[i]))
+                result.append(_snap_to_scale(blended, scale))
+            return result
+
+        # --- 6. Rhythm Quantization ---
+        def _quantize_t(t: float, g: float, strength: float) -> float:
+            snapped = round(t / g) * g
+            return max(0.0, t + strength * (snapped - t))
+
+        # --- 11. Cleanup (defined early; used throughout) ---
+        def _cleanup(note_list: list[Any], min_dur: float = 0.05) -> list[Any]:
+            cleaned = sorted(note_list, key=lambda n: (n.start, n.pitch))
+            result: list[Any] = []
+            last_end: dict[int, float] = {}
+            for note in cleaned:
+                if note.end - note.start < min_dur:
+                    continue
+                p = note.pitch
+                if last_end.get(p, -1.0) > note.start:
+                    note = copy.copy(note)
+                    note.start = last_end[p]
+                    if note.end - note.start < min_dur:
+                        continue
+                note = copy.copy(note)
+                note.velocity = _normalize_velocity(note.velocity, min_velocity=1)
+                result.append(note)
+                last_end[p] = note.end
+            return result
+
+        # --- 6b. Humanization ---
+        _hum_rng = np.random.default_rng(17)
+
+        def _humanize(note_list: list[Any]) -> list[Any]:
+            """Apply velocity curves and micro-timing drift for a human feel."""
+            result: list[Any] = []
+            n_notes = len(note_list)
+            for i, note in enumerate(note_list):
+                n = copy.copy(note)
+                # Sinusoidal accent over the phrase (arch shape)
+                phrase_pos = i / max(n_notes - 1, 1)
+                accent = int(round(8.0 * np.sin(np.pi * phrase_pos)))
+                rand_vel = int(_hum_rng.integers(-5, 6))
+                n.velocity = _normalize_velocity(n.velocity + accent + rand_vel, min_velocity=1)
+                # Smooth micro-timing: small Gaussian drift scaled by (1 - preserve_intent)
+                drift = float(_hum_rng.normal(0.0, 0.005 * (1.0 - preserve_intent)))
+                n.start = max(0.0, n.start + drift)
+                n.end = max(n.start + 0.05, n.end + drift)
+                result.append(n)
+            return result
+
+        # --- 7. Mode Logic helpers ---
+        _key_parts = detected_key.split()
+        _key_root = NOTE_NAMES.index(_key_parts[0]) if _key_parts and _key_parts[0] in NOTE_NAMES else 0
+        _key_mode_str = _key_parts[1] if len(_key_parts) > 1 else "major"
+
+        def _apply_bass_mode(note: Any) -> Any:
+            target = note.pitch
+            while target > 48:
+                target -= 12
+            while target < 36:
+                target += 12
+            snapped = _snap_to_scale(target, scale_pitches)
+            # Root-note bias: nudge toward key root if we're close
+            if abs((snapped % 12) - _key_root) <= 2:
+                root_cands = [p for p in scale_pitches if p % 12 == _key_root and 36 <= p <= 48]
+                if root_cands:
+                    snapped = min(root_cands, key=lambda p: abs(p - target))
+            note.pitch = snapped
+            note.start = _quantize_t(note.start, beat_length, 1.0)
+            # Longer note durations for bass — at least 1.5 beats
+            dur = max(beat_length * 1.5, round((note.end - note.start) / beat_length) * beat_length)
+            note.end = note.start + dur
+            return note
+
+        def _expand_chords(note_list: list[Any], scale: list[int]) -> list[Any]:
+            expanded: list[Any] = []
+            _chord_rng = np.random.default_rng(sum(n.pitch for n in note_list) if note_list else 0)
+            for n in note_list:
+                expanded.append(n)
+                # Determine third: major (+4) if pitch+4 is already in scale, else minor (+3)
+                third_semi = 4 if _snap_to_scale(n.pitch + 4, scale) == n.pitch + 4 else 3
+                fifth_semi = 7
+                # Occasional second inversion: 5th below root instead of 5th above
+                invert = _chord_rng.random() < 0.2
+                for semitones in (third_semi, fifth_semi):
+                    en = copy.copy(n)
+                    if invert and semitones == fifth_semi:
+                        en.pitch = _snap_to_scale(n.pitch - 5, scale)
+                    else:
+                        en.pitch = _snap_to_scale(n.pitch + semitones, scale)
+                    expanded.append(en)
+            return expanded
+
+        # --- 8. Build refined notes ---
+        orig_pitches = [n.pitch for n in all_notes]
+        # Context-aware directional snapping
+        snapped: list[int] = []
+        for _si, _p in enumerate(orig_pitches):
+            _prev = snapped[_si - 1] if _si > 0 else None
+            snapped.append(_snap_to_scale_directional(_p, scale_pitches, _prev))
+        contoured = _apply_contour(snapped, orig_pitches, scale_pitches, preserve_intent)
+
+        refined_notes: list[Any] = []
+        for i, note in enumerate(all_notes):
+            n = copy.copy(note)
+            n.pitch = contoured[i]
+            n.start = _quantize_t(n.start, grid, quantize_strength)
+            dur = n.end - n.start
+            n.end = n.start + max(grid * 0.5, dur)
+            n.velocity = _normalize_velocity(n.velocity, min_velocity=1)
+            if mode == "bass":
+                n = _apply_bass_mode(n)
+            refined_notes.append(n)
+
+        refined_notes = _cleanup(refined_notes)
+        if mode == "chords":
+            refined_notes = _cleanup(_expand_chords(refined_notes, scale_pitches))
+
+        # --- 12. Output directory ---
+        out_path = (
+            Path(output_dir).expanduser().resolve()
+            if output_dir
+            else Path("midi_refined").resolve()
+        )
+        _ensure_dir(out_path)
+        stem_name = midi_in_path.stem
+        midi_files_out: list[str] = []
+
+        def _write_notes_to_midi(note_list: list[Any], file_path: Path, bpm: float) -> None:
+            program_num = 33 if mode == "bass" else 0
+            pm_out = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+            instr = pretty_midi.Instrument(program=program_num)
+            for n in note_list:
+                start = float(max(0.0, n.start))
+                end = float(max(start + 0.01, n.end))
+                instr.notes.append(
+                    pretty_midi.Note(
+                        velocity=_normalize_velocity(n.velocity, min_velocity=1),
+                        pitch=int(max(0, min(127, n.pitch))),
+                        start=start,
+                        end=end,
+                    )
+                )
+            pm_out.instruments.append(instr)
+            pm_out.write(str(file_path))
+
+        # Save CLEAN MIDI (subtle humanization applied; refined_notes kept pure for variations)
+        clean_path = out_path / f"{stem_name}_clean.mid"
+        _write_notes_to_midi(_cleanup(_humanize(list(refined_notes))), clean_path, tempo_bpm)
+        midi_files_out.append(str(clean_path))
+        notes_log.append(f"Saved clean MIDI: {clean_path.name}")
+
+        # --- 9. Deterministic Variations ---
+        _VAR_TYPES = ["phrase_shift", "rhythm", "density", "velocity_phrasing", "combined"]
+
+        def _make_phrase_shift(base: list[Any], shift_steps: int) -> list[Any]:
+            result: list[Any] = []
+            for note in base:
+                n = copy.copy(note)
+                idx = _scale_idx(n.pitch, scale_pitches)
+                new_idx = max(0, min(len(scale_pitches) - 1, idx + shift_steps))
+                n.pitch = scale_pitches[new_idx]
+                result.append(n)
+            return _cleanup(_humanize(result))
+
+        def _make_rhythm_var(base: list[Any], rng_inst: Any) -> list[Any]:
+            result: list[Any] = []
+            for note in base:
+                n = copy.copy(note)
+                dur = n.end - n.start
+                dur_factor = 1.0 + float(rng_inst.uniform(-0.2, 0.2)) * variation
+                new_dur = max(grid * 0.5, dur * dur_factor)
+                synco = float(rng_inst.choice([-1, 0, 0, 1])) * grid * 0.5 * variation
+                n.start = max(0.0, n.start + synco)
+                n.end = n.start + new_dur
+                result.append(n)
+            return _cleanup(_humanize(result))
+
+        def _make_density_var(base: list[Any], rng_inst: Any) -> list[Any]:
+            result: list[Any] = []
+            for note in base:
+                r = float(rng_inst.random())
+                if r < variation * 0.25:
+                    continue
+                result.append(copy.copy(note))
+                if r > 1.0 - variation * 0.15:
+                    dup = copy.copy(note)
+                    half = (note.end - note.start) * 0.5
+                    dup.start = note.start + half
+                    dup.end = note.end + half
+                    idx = _scale_idx(dup.pitch, scale_pitches)
+                    dup.pitch = scale_pitches[
+                        max(0, min(len(scale_pitches) - 1, idx + int(rng_inst.choice([-1, 1]))))
+                    ]
+                    result.append(dup)
+            if not result:
+                result = [copy.copy(base[0])] if base else []
+            return _cleanup(_humanize(result))
+
+        def _make_velocity_phrasing(base: list[Any]) -> list[Any]:
+            result: list[Any] = []
+            n_notes = len(base)
+            for i, note in enumerate(base):
+                n = copy.copy(note)
+                phrase_pos = i / max(n_notes - 1, 1)
+                arch = int(round(20.0 * np.sin(np.pi * phrase_pos) * variation))
+                n.velocity = _normalize_velocity(n.velocity + arch, min_velocity=1)
+                result.append(n)
+            return _cleanup(result)
+
+        rng = np.random.default_rng(42)
+        for var_idx in range(num_variations):
+            var_type = _VAR_TYPES[var_idx % len(_VAR_TYPES)]
+            var_rng = np.random.default_rng(42 + var_idx * 13)
+            if var_type == "phrase_shift":
+                shift = int(var_rng.choice([-2, -1, 1, 2]))
+                var_notes = _make_phrase_shift(refined_notes, shift)
+                label = f"phrase_shift_{'p' if shift > 0 else 'm'}{abs(shift)}"
+            elif var_type == "rhythm":
+                var_notes = _make_rhythm_var(refined_notes, var_rng)
+                label = "rhythm"
+            elif var_type == "density":
+                var_notes = _make_density_var(refined_notes, var_rng)
+                label = "density"
+            elif var_type == "velocity_phrasing":
+                var_notes = _make_velocity_phrasing(refined_notes)
+                label = "velocity_phrasing"
+            else:
+                shift = int(var_rng.choice([-1, 1]))
+                var_notes = _make_phrase_shift(refined_notes, shift)
+                var_notes = _make_rhythm_var(var_notes, var_rng)
+                label = "combined"
+            if mode == "chords":
+                var_notes = _cleanup(_expand_chords(var_notes, scale_pitches))
+            var_path = out_path / f"{stem_name}_var_{label}.mid"
+            if str(var_path) in midi_files_out:
+                var_path = out_path / f"{stem_name}_var_{label}_{var_idx}.mid"
+            _write_notes_to_midi(var_notes, var_path, tempo_bpm)
+            midi_files_out.append(str(var_path))
+        notes_log.append(f"Saved {num_variations} named deterministic variations.")
+
+        # --- 10. Magenta Variations (always attempted) ---
+        _MAG_TRANSFORMS = ["time_stretch", "pitch_transpose", "density_variation", "retrograde"]
+
+        def _apply_magenta_transform(base: list[Any], transform: str, mag_rng_inst: Any) -> list[Any]:
+            result: list[Any] = []
+            if transform == "time_stretch":
+                direction = 1 if mag_rng_inst.random() > 0.5 else -1
+                factor = float(max(0.7, min(1.4, 1.0 + direction * float(mag_rng_inst.uniform(0.08, 0.20)))))
+                for note in base:
+                    n = copy.copy(note)
+                    n.start = n.start * factor
+                    n.end = n.end * factor
+                    result.append(n)
+            elif transform == "pitch_transpose":
+                steps = int(mag_rng_inst.choice([-3, -2, -1, 1, 2, 3]))
+                for note in base:
+                    n = copy.copy(note)
+                    idx = _scale_idx(n.pitch, scale_pitches)
+                    n.pitch = scale_pitches[max(0, min(len(scale_pitches) - 1, idx + steps))]
+                    result.append(n)
+            elif transform == "density_variation":
+                prev_end = 0.0
+                for i, note in enumerate(base):
+                    if float(mag_rng_inst.random()) < 0.20 * variation:
+                        continue
+                    n = copy.copy(note)
+                    # Insert scale-passing note when gap is large enough
+                    if i > 0 and result:
+                        gap = n.start - prev_end
+                        if gap > grid * 1.5 and float(mag_rng_inst.random()) < 0.30 * variation:
+                            passing = copy.copy(n)
+                            prev_idx = _scale_idx(result[-1].pitch, scale_pitches)
+                            cur_idx = _scale_idx(n.pitch, scale_pitches)
+                            mid_idx = (prev_idx + cur_idx) // 2
+                            passing.pitch = scale_pitches[max(0, min(len(scale_pitches) - 1, mid_idx))]
+                            passing.start = prev_end + grid * 0.5
+                            passing.end = passing.start + grid
+                            passing.velocity = _normalize_velocity(n.velocity - 12, min_velocity=1)
+                            result.append(passing)
+                    result.append(n)
+                    prev_end = n.end
+            elif transform == "retrograde":
+                pitches_rev = [note.pitch for note in reversed(base)]
+                for i, note in enumerate(base):
+                    n = copy.copy(note)
+                    n.pitch = pitches_rev[i]
+                    result.append(n)
+            else:
+                result = [copy.copy(n) for n in base]
+            return _cleanup(_humanize(result))
+
+        magenta_ok = False
+        try:
+            import note_seq  # type: ignore
+
+            magenta_ok = True
+        except ImportError:
+            notes_log.append(
+                "WARNING: note_seq (Magenta) not installed. "
+                "Generating structurally distinct fallback variations."
+            )
+
+        if magenta_ok:
+            try:
+                ns = note_seq.midi_file_to_note_sequence(str(clean_path))
+                for mag_idx in range(magenta_variations):
+                    mag_rng_inst = np.random.default_rng(7 + mag_idx * 31)
+                    transform = _MAG_TRANSFORMS[mag_idx % len(_MAG_TRANSFORMS)]
+                    mag_ns = copy.deepcopy(ns)
+                    if transform == "time_stretch":
+                        direction = 1 if mag_rng_inst.random() > 0.5 else -1
+                        factor = float(max(0.7, min(1.4, 1.0 + direction * float(mag_rng_inst.uniform(0.08, 0.20)))))
+                        for n in mag_ns.notes:
+                            n.start_time = n.start_time * factor
+                            n.end_time = n.end_time * factor
+                        mag_ns.total_time = mag_ns.total_time * factor
+                    elif transform == "pitch_transpose":
+                        steps = int(mag_rng_inst.choice([-3, -2, -1, 1, 2, 3]))
+                        for n in mag_ns.notes:
+                            idx = _scale_idx(n.pitch, scale_pitches)
+                            n.pitch = scale_pitches[max(0, min(len(scale_pitches) - 1, idx + steps))]
+                    else:
+                        # density_variation / retrograde: operate on note list
+                        mag_notes_t = _apply_magenta_transform(refined_notes, transform, mag_rng_inst)
+                        if mode == "chords":
+                            mag_notes_t = _cleanup(_expand_chords(mag_notes_t, scale_pitches))
+                        mag_path = out_path / f"{stem_name}_magenta_transform_{mag_idx}.mid"
+                        _write_notes_to_midi(mag_notes_t, mag_path, tempo_bpm)
+                        midi_files_out.append(str(mag_path))
+                        continue
+                    mag_path = out_path / f"{stem_name}_magenta_transform_{mag_idx}.mid"
+                    note_seq.note_sequence_to_midi_file(mag_ns, str(mag_path))
+                    midi_files_out.append(str(mag_path))
+                notes_log.append(f"Saved {magenta_variations} Magenta transform variations.")
+            except Exception as mag_exc:
+                notes_log.append(
+                    f"WARNING: Magenta processing failed: {mag_exc}. "
+                    "Generating structurally distinct fallback variations."
+                )
+                magenta_ok = False
+
+        if not magenta_ok:
+            for mag_idx in range(magenta_variations):
+                mag_rng_inst = np.random.default_rng(99 + mag_idx * 31)
+                transform = _MAG_TRANSFORMS[mag_idx % len(_MAG_TRANSFORMS)]
+                mag_notes_fb = _apply_magenta_transform(refined_notes, transform, mag_rng_inst)
+                if mode == "chords":
+                    mag_notes_fb = _cleanup(_expand_chords(mag_notes_fb, scale_pitches))
+                mag_path = out_path / f"{stem_name}_magenta_fallback_{mag_idx}_{transform}.mid"
+                _write_notes_to_midi(mag_notes_fb, mag_path, tempo_bpm)
+                midi_files_out.append(str(mag_path))
+            notes_log.append(
+                f"Saved {magenta_variations} structurally distinct fallback Magenta-style variations "
+                "(note_seq unavailable)."
+            )
+
+        return {
+            "input": str(midi_in_path),
+            "output_dir": str(out_path),
+            "midi_files": midi_files_out,
+            "detected_key": detected_key,
+            "notes": notes_log,
+        }
+
+    except Exception as exc:
+        trace = traceback.format_exc()
+        logger.error("refine_midi_engine failed: %s", exc)
+        logger.error(trace)
+        return {
+            "input": str(midi_path),
+            "output_dir": str(output_dir or "midi_refined"),
+            "midi_files": [],
+            "detected_key": "",
+            "notes": ["refine_midi_engine_failed", str(exc), trace],
         }
 
 
